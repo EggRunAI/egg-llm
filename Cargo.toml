@@ -1,0 +1,16 @@
+[package]
+name = "llm-infer"
+version = "0.1.0"
+edition = "2021"
+description = "GPU-accelerated LLM inference on the M5 Max (via Vulkan/Venus + llama.cpp), driven from Rust"
+
+[[bin]]
+name = "llm-infer"
+path = "src/main.rs"
+
+# Pure std — no external crates, so the build needs no registry access and the
+# lightest possible link step.
+
+[profile.release]
+opt-level = 2
+codegen-units = 1

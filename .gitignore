@@ -1,0 +1,18 @@
+# Rust build output
+/target
+
+# Prebuilt llama.cpp Vulkan runtime (downloaded, ~90MB) — not source
+/bin
+
+# Model weights (GGUF, ~1GB+) — downloaded, not source
+/models
+
+# Misc
+*.log
+
+# vendored upstream header kept for ABI reference is OK to commit; test models are not
+models/test2.gguf
+
+# scratch redirect files from manual runs
+*.out
+*.err

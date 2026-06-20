@@ -1,0 +1,2 @@
+# build.sh installs build-essential, so cargo links with the default system
+# cc/ld — no custom linker shim needed.
