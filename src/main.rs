@@ -233,7 +233,7 @@ fn main() {
         // then init llama. The default loader searches near the exe/CWD, so we
         // give it the explicit directory where libggml-vulkan.so lives.
         let lib_dir = std::env::var("LLM_LIB_DIR")
-            .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/bin/llama-b9670").to_string());
+            .unwrap_or_else(|_| env!("LLM_LIB_DIR_DEFAULT").to_string());
         let lib_dir_c = CString::new(lib_dir.clone()).unwrap();
         ggml_backend_load_all_from_path(lib_dir_c.as_ptr());
         llama_backend_init();

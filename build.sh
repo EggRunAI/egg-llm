@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Pinned llama.cpp commit — the FFI/protocol must match the host backend.
-LLAMA_COMMIT="f3e182816421c648188b5eab269853bf1531d950"
-LLAMA_DIR="${LLAMA_DIR:-${HOME}/llama.cpp}"
+# Pinned llama.cpp build — the FFI/protocol must match the host backend.
+# LLAMA_COMMIT / LLAMA_BUILD live in llama-version.env (single source of truth).
 REPO="$(cd "$(dirname "$0")" && pwd)"
-LIB_DST="${REPO}/bin/llama-b9670"
+. "${REPO}/llama-version.env"
+LLAMA_DIR="${LLAMA_DIR:-${HOME}/llama.cpp}"
+LIB_DST="${REPO}/bin/llama-${LLAMA_BUILD}"
 
 # 1. system dependencies (build-essential provides cc/ld so cargo links normally)
 sudo apt-get update
