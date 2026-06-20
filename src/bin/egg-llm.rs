@@ -208,6 +208,32 @@ impl Drop for RawTty {
     }
 }
 
+/// Download a default model with `curl` if the path doesn't exist yet — the FFI
+/// engine can't fetch one itself. Override the URL with LLM_MODEL_URL, or point
+/// LLM_MODEL at a local file to skip the download entirely.
+fn ensure_model(path: &str) {
+    if std::path::Path::new(path).exists() {
+        return;
+    }
+    let url = std::env::var("LLM_MODEL_URL").unwrap_or_else(|_| {
+        "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf".to_string()
+    });
+    println!("{DIM}  model '{path}' not found — downloading…{RESET}");
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let ok = std::process::Command::new("curl")
+        .args(["-L", "--fail", "--retry", "3", "-o", path, &url])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        eprintln!("error: could not download a model. Set LLM_MODEL to a local .gguf, or LLM_MODEL_URL to a URL.");
+        std::process::exit(1);
+    }
+    println!("{DIM}  model ready → {path}{RESET}\n");
+}
+
 fn main() {
     // Select the APIR capset — the host GPU via API Remoting. Without this the
     // ggml-virtgpu frontend defaults to the Venus capset (the graphics path),
@@ -223,6 +249,8 @@ fn main() {
     println!("{GOLD}{BOLD}  Egg LLM{RESET}{DIM} — streaming chat, in-VM on the host GPU{RESET}");
     println!("{DIM}  model {model_path}  ·  ngl {n_gpu_layers}  ·  ctx {n_ctx}{RESET}");
     println!("{DIM}  type and press Enter · /reset clears the chat · /quit (or Ctrl-D) exits{RESET}\n");
+
+    ensure_model(&model_path);
 
     unsafe {
         let lib_dir = std::env::var("LLM_LIB_DIR")
