@@ -336,19 +336,30 @@ fn main() {
             let mut n_decoded = 0i32;
             let mut n_past = 0i32;
             let mut cur = toks.clone();
+            let n_prompt = cur.len() as i32;
             toks.clear();
-            let t_gen = Instant::now();
+            // The first decode processes the whole prompt (prefill); every later
+            // decode is a single generated token. Time the two phases separately
+            // so prompt throughput doesn't get folded into the decode rate.
+            let mut prefill_s = 0.0f64;
+            let mut t_decode = Instant::now();
             loop {
                 if n_past + cur.len() as i32 > ctx_cap {
                     print!("{DIM}[context full]{RESET}");
                     break;
                 }
+                let is_prefill = n_past == 0;
+                let t_step = Instant::now();
                 let batch = llama_batch_get_one(cur.as_mut_ptr(), cur.len() as c_int);
                 if llama_decode(ctx, batch) != 0 {
                     eprintln!("\nerror: llama_decode failed");
                     break;
                 }
                 n_past += cur.len() as i32;
+                if is_prefill {
+                    prefill_s = t_step.elapsed().as_secs_f64();
+                    t_decode = Instant::now();
+                }
 
                 let tok = llama_sampler_sample(smpl, ctx, -1);
                 if llama_vocab_is_eog(vocab, tok) {
@@ -365,9 +376,12 @@ fn main() {
                 }
                 cur = vec![tok];
             }
-            let gen_s = t_gen.elapsed().as_secs_f64();
-            let tps = if gen_s > 0.0 { n_decoded as f64 / gen_s } else { 0.0 };
-            println!("\n{DIM}  {n_decoded} tok · {tps:.1} tok/s{RESET}\n");
+            let decode_s = t_decode.elapsed().as_secs_f64();
+            let prompt_tps = if prefill_s > 0.0 { n_prompt as f64 / prefill_s } else { 0.0 };
+            let decode_tps = if decode_s > 0.0 { n_decoded as f64 / decode_s } else { 0.0 };
+            println!(
+                "\n{DIM}  prompt {n_prompt} tok @ {prompt_tps:.1} t/s · decode {n_decoded} tok @ {decode_tps:.1} t/s{RESET}\n"
+            );
 
             history.push(("assistant".into(), reply.trim().to_string()));
 
