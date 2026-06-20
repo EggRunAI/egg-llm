@@ -209,6 +209,12 @@ impl Drop for RawTty {
 }
 
 fn main() {
+    // Select the APIR capset — the host GPU via API Remoting. Without this the
+    // ggml-virtgpu frontend defaults to the Venus capset (the graphics path),
+    // whose handshake times out for compute and the process aborts. Equivalent
+    // to running with GGML_REMOTING_USE_APIR_CAPSET=1 (what llama-cli used).
+    std::env::set_var("GGML_REMOTING_USE_APIR_CAPSET", "1");
+
     let model_path = std::env::var("LLM_MODEL").unwrap_or_else(|_| "models/model.gguf".into());
     let n_gpu_layers: i32 = std::env::var("LLM_NGL").ok().and_then(|v| v.parse().ok()).unwrap_or(99);
     let n_ctx: u32 = std::env::var("LLM_CTX").ok().and_then(|v| v.parse().ok()).unwrap_or(8192);
