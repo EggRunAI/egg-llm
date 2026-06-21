@@ -234,6 +234,18 @@ fn ensure_model(path: &str) {
     println!("{DIM}  model ready → {path}{RESET}\n");
 }
 
+/// Create an inference context sized to `n_ctx`, threads = available parallelism.
+/// Used at startup and to drop the KV cache on `/reset`.
+unsafe fn create_context(model: *mut Model, n_ctx: u32) -> *mut Context {
+    let mut cparams = llama_context_default_params();
+    cparams.n_ctx = n_ctx;
+    cparams.n_batch = n_ctx;
+    let nthreads = std::thread::available_parallelism().map(|n| n.get() as i32).unwrap_or(4);
+    cparams.n_threads = nthreads;
+    cparams.n_threads_batch = nthreads;
+    llama_init_from_model(model, cparams)
+}
+
 fn main() {
     // Select the APIR capset — the host GPU via API Remoting. Without this the
     // ggml-virtgpu frontend defaults to the Venus capset (the graphics path),
@@ -271,9 +283,29 @@ fn main() {
         println!("{DIM}  model loaded in {:.0} ms{RESET}\n", t_load.elapsed().as_secs_f64() * 1000.0);
         let vocab = llama_model_get_vocab(model);
 
-        // History of (role, content). Re-templated each turn against a fresh
-        // context — correct and simple; incremental KV reuse is a later optimization.
+        // Persistent context across turns: the KV cache holds the whole
+        // conversation, so each turn only decodes the NEW tokens (the template
+        // delta) instead of re-prefilling the entire history. Mirrors llama.cpp's
+        // simple-chat. `prev_len` is the byte length already committed to the KV
+        // (the history templated WITHOUT a trailing generation prompt); `n_past`
+        // is the KV token count.
         let mut history: Vec<(String, String)> = Vec::new();
+        let mut ctx = create_context(model, n_ctx);
+        if ctx.is_null() {
+            eprintln!("error: failed to create context");
+            std::process::exit(1);
+        }
+        let ctx_cap = llama_n_ctx(ctx) as i32;
+
+        // One sampler for the whole session (carries its own RNG state).
+        let smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
+        llama_sampler_chain_add(smpl, llama_sampler_init_top_k(40));
+        llama_sampler_chain_add(smpl, llama_sampler_init_top_p(0.95, 1));
+        llama_sampler_chain_add(smpl, llama_sampler_init_temp(0.7));
+        llama_sampler_chain_add(smpl, llama_sampler_init_dist(0xC0FFEE));
+
+        let mut prev_len: usize = 0;
+        let mut n_past: i32 = 0;
 
         loop {
             print!("{GOLD}{BOLD}you ›{RESET} ");
@@ -292,7 +324,16 @@ fn main() {
             match user {
                 "/quit" | "/exit" => break,
                 "/reset" => {
+                    // No kv-clear FFI here, so drop the KV by recreating the context.
+                    llama_free(ctx);
+                    ctx = create_context(model, n_ctx);
+                    if ctx.is_null() {
+                        eprintln!("error: failed to recreate context");
+                        break;
+                    }
                     history.clear();
+                    prev_len = 0;
+                    n_past = 0;
                     println!("{DIM}  (chat reset){RESET}\n");
                     continue;
                 }
@@ -300,47 +341,41 @@ fn main() {
             }
             history.push(("user".into(), user.to_string()));
 
-            // Build the full prompt from history via the model's chat template.
-            let prompt = apply_chat_template(model, &history);
-            let mut toks = tokenize(vocab, &prompt, true);
-            if toks.is_empty() {
+            // Template the full history (with generation prompt) and feed only the
+            // part beyond what the KV already holds — usually just the new user
+            // turn, so the prior conversation isn't re-prefilled.
+            let full = apply_chat_template(model, &history, true);
+            let delta = if prev_len <= full.len() && full.is_char_boundary(prev_len) {
+                full[prev_len..].to_string()
+            } else {
+                // Template prefix changed unexpectedly — rebuild the KV from scratch.
+                llama_free(ctx);
+                ctx = create_context(model, n_ctx);
+                if ctx.is_null() {
+                    eprintln!("error: failed to recreate context");
+                    break;
+                }
+                n_past = 0;
+                full.clone()
+            };
+
+            // BOS only on the very first prompt (when the KV is empty).
+            let mut cur = tokenize(vocab, &delta, n_past == 0);
+            if cur.is_empty() {
                 println!("{DIM}  (empty prompt){RESET}");
                 history.pop();
                 continue;
             }
-
-            // Fresh context per turn so the KV cache never carries stale state.
-            let mut cparams = llama_context_default_params();
-            cparams.n_ctx = n_ctx;
-            cparams.n_batch = n_ctx;
-            let nthreads = std::thread::available_parallelism().map(|n| n.get() as i32).unwrap_or(4);
-            cparams.n_threads = nthreads;
-            cparams.n_threads_batch = nthreads;
-            let ctx = llama_init_from_model(model, cparams);
-            if ctx.is_null() {
-                eprintln!("error: failed to create context");
-                break;
-            }
-            let ctx_cap = llama_n_ctx(ctx) as i32;
-
-            let smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
-            llama_sampler_chain_add(smpl, llama_sampler_init_top_k(40));
-            llama_sampler_chain_add(smpl, llama_sampler_init_top_p(0.95, 1));
-            llama_sampler_chain_add(smpl, llama_sampler_init_temp(0.7));
-            llama_sampler_chain_add(smpl, llama_sampler_init_dist(0xC0FFEE));
+            let n_prompt = cur.len() as i32;
 
             print!("{GOLD}{BOLD}egg ›{RESET} ");
             flush();
 
             let mut reply = String::new();
             let mut n_decoded = 0i32;
-            let mut n_past = 0i32;
-            let mut cur = toks.clone();
-            let n_prompt = cur.len() as i32;
-            toks.clear();
-            // The first decode processes the whole prompt (prefill); every later
-            // decode is a single generated token. Time the two phases separately
-            // so prompt throughput doesn't get folded into the decode rate.
+            // First decode of the turn is the prompt delta (prefill); later decodes
+            // are single generated tokens. Time the two phases separately.
+            let mut first = true;
             let mut prefill_s = 0.0f64;
             let mut t_decode = Instant::now();
             loop {
@@ -348,17 +383,19 @@ fn main() {
                     print!("{DIM}[context full]{RESET}");
                     break;
                 }
-                let is_prefill = n_past == 0;
                 let t_step = Instant::now();
+                // pos = NULL → llama_decode continues positions from the KV's end,
+                // so the persistent cache is reused across turns.
                 let batch = llama_batch_get_one(cur.as_mut_ptr(), cur.len() as c_int);
                 if llama_decode(ctx, batch) != 0 {
                     eprintln!("\nerror: llama_decode failed");
                     break;
                 }
                 n_past += cur.len() as i32;
-                if is_prefill {
+                if first {
                     prefill_s = t_step.elapsed().as_secs_f64();
                     t_decode = Instant::now();
+                    first = false;
                 }
 
                 let tok = llama_sampler_sample(smpl, ctx, -1);
@@ -384,10 +421,13 @@ fn main() {
             );
 
             history.push(("assistant".into(), reply.trim().to_string()));
-
-            llama_sampler_free(smpl);
-            llama_free(ctx);
+            // Commit length = full history templated WITHOUT the generation prompt,
+            // so the next turn's delta starts right after the assistant content.
+            prev_len = apply_chat_template(model, &history, false).len();
         }
+
+        llama_sampler_free(smpl);
+        llama_free(ctx);
 
         llama_model_free(model);
         llama_backend_free();
@@ -438,7 +478,7 @@ fn read_line() -> Option<String> {
 }
 
 /// Format the whole conversation using the model's built-in chat template.
-unsafe fn apply_chat_template(model: *const Model, history: &[(String, String)]) -> String {
+unsafe fn apply_chat_template(model: *const Model, history: &[(String, String)], add_ass: bool) -> String {
     let tmpl = llama_model_chat_template(model, std::ptr::null());
 
     // Keep the CStrings alive for the duration of the FFI call.
@@ -458,7 +498,7 @@ unsafe fn apply_chat_template(model: *const Model, history: &[(String, String)])
             tmpl,
             msgs.as_ptr(),
             msgs.len(),
-            true,
+            add_ass,
             buf.as_mut_ptr() as *mut c_char,
             buf.len() as c_int,
         );
@@ -484,7 +524,9 @@ unsafe fn apply_chat_template(model: *const Model, history: &[(String, String)])
     for (role, content) in history {
         s.push_str(&format!("<|im_start|>{role}\n{content}<|im_end|>\n"));
     }
-    s.push_str("<|im_start|>assistant\n");
+    if add_ass {
+        s.push_str("<|im_start|>assistant\n");
+    }
     s
 }
 
