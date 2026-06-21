@@ -27,6 +27,16 @@ tok/s** on the Apple M5 Max GPU, generated from inside the egg — with the GNOM
 desktop still rendering on Venus *alongside* it (APIR capset 10 coexists with the
 graphics path; the GUI never flinches).
 
+## Model choice
+
+Prefer **standard-attention** models (Qwen, Llama, Mistral, Gemma) over
+**linear-attention** ones (Mamba/SSM, Gated Delta Net, GLA, RWKV) at the same
+parameter size. The GPU runs over **APIR**, which remotes one ggml compute graph
+per virtio-gpu round-trip; linear-attention architectures are far more op-dense
+per token, so that per-graph overhead drags their throughput well below a
+standard-attention model of equal size. For best tok/s here, pick standard
+attention.
+
 ## Run it (in the guest)
 
 ```bash
